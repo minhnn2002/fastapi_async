@@ -1,0 +1,13 @@
+[project]
+name = "fastapi-async"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiomysql>=0.2.0",
+    "fastapi[standard]>=0.117.1",
+    "mysql-connector-python>=9.4.0",
+    "pydantic-settings>=2.11.0",
+    "sqlmodel>=0.0.25",
+]

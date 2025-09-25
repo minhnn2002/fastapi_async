@@ -1,0 +1,249 @@
+from typing import Annotated
+from fastapi import APIRouter, Depends, status, HTTPException, Query
+from fastapi.responses import StreamingResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, and_, update, or_, case, text, tuple_
+from app.db import get_session
+from app.models import SMS_Data
+from app.schemas import *
+from app.utils import *
+from app.config import settings
+from collections import defaultdict
+import csv
+import io
+
+
+router = APIRouter(
+    prefix="/content",
+    tags=['Content']
+)
+
+@router.get("/")
+async def get_spam_base_on_content(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    from_datetime: Annotated[str, Query(description="Time Start: (ISO format)")] = None,
+    to_datetime: Annotated[str, Query(description="Time End: (ISO format)")] = None,
+    page: Annotated[int, Query(ge=0)] = 0,
+    page_size: Annotated[int, Query(description="The number of record in one page", enum=[10, 50, 100])] = 10,
+    text_keyword: Annotated[str, Query(description="Filter messages that contain this keyword (case insensitive)")] = None,
+    phone_num: Annotated[str, Query(description="Filter phone number that contain this pattern (case insensitive)")] = None
+) -> BasePaginatedResponseContent:
+    
+    # --- Parse time string ---
+    from_datetime = parse_datetime(from_datetime)
+    to_datetime = parse_datetime(to_datetime)
+
+    # --- Time validation ---
+    from_datetime, to_datetime = await validate_time_range(session, from_datetime, to_datetime)
+
+    # --- Base filters ---
+    filters = [SMS_Data.ts.between(from_datetime, to_datetime)]
+    if text_keyword:
+        filters.append(SMS_Data.text_sms.ilike(f"%{text_keyword}%"))
+    if phone_num:
+        filters.append(SMS_Data.sdt_in.ilike(f"%{phone_num}%"))
+
+    # --- Aggregation query ---
+    agg_query = (
+        select(
+            SMS_Data.group_id,
+            SMS_Data.sdt_in,
+            func.min(SMS_Data.ts).label("first_ts"),
+            func.count().label("frequency"),
+            func.min_by(SMS_Data.text_sms, SMS_Data.ts).label("agg_message")
+        )
+        .where(*filters)
+        .group_by(SMS_Data.group_id, SMS_Data.sdt_in)
+        .having(func.count() >= 20)
+        .subquery()
+    )
+
+    # --- Pagination query ---
+    main_stmt = (
+        select(
+            agg_query.c.group_id,
+            agg_query.c.sdt_in,
+            agg_query.c.first_ts,
+            agg_query.c.frequency,
+            agg_query.c.agg_message,
+            func.count().over().label("total_records")
+        )
+        .order_by(agg_query.c.first_ts, agg_query.c.group_id, agg_query.c.sdt_in)
+        .offset(page * page_size)
+        .limit(page_size)
+    )
+    result = await session.execute(main_stmt)
+    grouped_records = result.all()
+    total_records = grouped_records[0].total_records if grouped_records else 0
+
+    # --- Second query: all messages ---
+    group_ids = [r.group_id for r in grouped_records]
+    phone_numbers = [r.sdt_in for r in grouped_records]
+
+    msg_stmt = (
+        select(
+            SMS_Data.group_id,
+            SMS_Data.sdt_in,
+            SMS_Data.text_sms,
+            func.count().label("count")
+        )
+        .where(
+            SMS_Data.group_id.in_(group_ids),
+            SMS_Data.sdt_in.in_(phone_numbers),
+            *filters
+        )
+        .group_by(SMS_Data.group_id, SMS_Data.sdt_in, SMS_Data.text_sms)
+    )
+    result = await session.execute(msg_stmt)
+    all_messages = result.all()
+
+    # --- Build message dictionary ---
+    messages_dict = defaultdict(list)
+    for m in all_messages:
+        messages_dict[(m.group_id, m.sdt_in)].append(
+            MessageCount(text_sms=m.text_sms, count=m.count)
+        )
+
+    # --- Build result ---
+    start_index = page * page_size + 1
+    result = [
+        SMSGroupedContent(
+            stt=i,
+            group_id=r.group_id,
+            sdt_in=r.sdt_in,
+            frequency=r.frequency,
+            ts=r.first_ts,
+            agg_message=r.agg_message,
+            messages=messages_dict.get((r.group_id, r.sdt_in), [])
+        )
+        for i, r in enumerate(grouped_records, start=start_index)
+    ]
+
+    return BasePaginatedResponseContent(
+        status_code=200,
+        message="Success",
+        data=result,
+        error=False,
+        error_message="",
+        page=page,
+        limit=page_size,
+        total=total_records
+    )
+
+
+@router.get("/export")
+async def export_content_data(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    from_datetime: Annotated[str, Query(description="Time Start: (ISO format)")] = None,
+    to_datetime: Annotated[str, Query(description="Time End: (ISO format)")] = None,
+    text_keyword: Annotated[str, Query(description="Filter messages that contain this keyword (case insensitive)")] = None,
+    phone_num: Annotated[str, Query(description="Filter phone number that contain this pattern (case insensitive)")] = None
+):
+
+    # --- Parse and validate datetime ---
+    from_datetime = parse_datetime(from_datetime)
+    to_datetime = parse_datetime(to_datetime)
+    from_datetime, to_datetime = await validate_time_range(session, from_datetime, to_datetime)
+
+    # --- Build filters ---
+    filters = [SMS_Data.ts.between(from_datetime, to_datetime)]
+    if text_keyword:
+        filters.append(SMS_Data.text_sms.ilike(f"%{text_keyword}%"))
+    if phone_num:
+        filters.append(SMS_Data.sdt_in.ilike(f"%{phone_num}%"))
+
+    # --- Aggregation query ---
+    agg_query = (
+        select(
+            SMS_Data.group_id,
+            SMS_Data.sdt_in,
+            func.count().label("frequency"),
+            func.min(SMS_Data.ts).label("first_ts"),
+            func.min_by(SMS_Data.text_sms, SMS_Data.ts).label("agg_message")
+        )
+        .where(*filters)
+        .group_by(SMS_Data.group_id, SMS_Data.sdt_in)
+        .having(func.count() >= 20)
+        .execution_options(stream_results=True)
+    )
+
+    # --- Async CSV streaming generator ---
+    async def stream():
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, quoting=csv.QUOTE_ALL)
+
+        # Write header
+        writer.writerow(["group_id", "sdt_in", "frequency", "first_ts", "agg_message"])
+        yield buffer.getvalue()
+        buffer.seek(0)
+        buffer.truncate(0)
+
+        # Stream rows from DB within a transaction
+        row_count = 0
+        async with session.begin():  # Ensure session remains open during streaming
+            result = await session.stream(agg_query)  # Await to get AsyncResult
+            async for row in result:  # Iterate directly over AsyncResult
+                row_count += 1
+                writer.writerow([row.group_id, row.sdt_in, row.frequency, row.first_ts, row.agg_message])
+                yield buffer.getvalue()
+                buffer.seek(0)
+                buffer.truncate(0)
+            if row_count == 0:
+                writer.writerow(["No data found"])
+                yield buffer.getvalue()
+
+    # --- Return StreamingResponse ---
+    return StreamingResponse(
+        stream(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=frequency_export.csv"}
+    )
+
+@router.put("/")
+async def feedback_base_on_content(
+    user_feedback: list[ContentFeedback],
+    session: AsyncSession = Depends(get_session),
+):
+    if not user_feedback:
+        raise HTTPException(
+            status_code=400, detail="No feedback data provided"
+        )
+
+    cases_group = []
+    cases_sdt = []
+    params = {}
+
+    for idx, item in enumerate(user_feedback):
+        gid_key = f"gid_{idx}"
+        sdt_key = f"sdt_{idx}"
+        fb_key = f"fb_{idx}"
+
+        cases_group.append(f"WHEN :{gid_key} AND sdt_in = :{sdt_key} THEN :{fb_key}")
+        cases_sdt.append(f"(group_id = :{gid_key} AND sdt_in = :{sdt_key})")
+
+        params[gid_key] = item.group_id
+        params[sdt_key] = item.sdt_in
+        params[fb_key] = item.feedback
+
+    case_sql = " ".join(cases_group)
+    where_sql = " OR ".join(cases_sdt)
+
+    sql = text(f"""
+        UPDATE {settings.TABLE_NAME}
+        SET feedback = CASE {case_sql} END
+        WHERE {where_sql}
+    """)
+
+    result = await session.execute(sql, params)
+    await session.commit()
+
+    total_updated = result.rowcount or 0
+    if total_updated == 0:
+        raise HTTPException(status_code=404, detail="No records matched your condition")
+
+    return BaseResponse(
+        status_code=200,
+        message=f"Updated {total_updated} records",
+        error=False,
+        error_message=None
+    )
