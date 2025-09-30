@@ -1,32 +1,7 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
 from app.models import *
-
-
-def parse_datetime(dt_str: str) -> datetime:
-    """
-    Convert datetime string to datetime with timezone.
-    """
-
-    if dt_str is None:
-        return None
-
-    try:
-        dt = dt_str.replace(' ', '+')
-        dt = datetime.fromisoformat(dt)
-        if dt.tzinfo is None: 
-            raise ValueError("Missing timezone info")
-        return dt
-    except ValueError:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": f"Invalid datetime format: {dt_str}. Use ISO 8601, e.g., 2025-09-10T15:15:00+07:00"
-            }
-        )
-
-
 
 async def validate_time_range(
     session,
@@ -63,3 +38,33 @@ async def validate_time_range(
         )
 
     return from_datetime, to_datetime
+
+
+
+
+def parse_datetime(v: str | int | float):
+    if v is None:
+        return None
+    # UTC_PLUS_7 = timezone(timedelta(hours=7))
+    if isinstance(v, (int, float)) or (isinstance(v, str) and v.isdigit()):
+        v = int(v)
+        if abs(v) > 2e10:  
+            dt = datetime.fromtimestamp(v / 1000, tz=timezone.utc)
+        else:  
+            dt = datetime.fromtimestamp(v, tz=timezone.utc)
+        # return dt.astimezone(UTC_PLUS_7)
+        return dt
+    
+    if isinstance(v, str):
+        if v.endswith("Z"):
+            v = v[:-1] + "+00:00"
+        v = v.replace(' ', '+')
+        dt = datetime.fromisoformat(v)
+
+        if dt.tzinfo is None:
+            raise ValueError("Datetime string must include timezone (Z or ±HH:MM)")
+
+        # return dt.astimezone(UTC_PLUS_7)
+        return dt
+
+    raise ValueError("Invalid datetime format")

@@ -1,14 +1,15 @@
 from typing import Annotated
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, text, func
+from sqlalchemy import select, text, func, case, and_, or_
 from app.db import get_session
 from app.models import SMS_Data
 from app.schemas import *
 from app.utils import *
 from app.config import settings
 from datetime import datetime
+from pydantic import BeforeValidator
 import csv
 from collections import defaultdict
 import io
@@ -20,59 +21,82 @@ router = APIRouter(
 
 
 @router.get("/")
-async def get_spam_base_on_frequency(
+async def get_spam_base_on_content(
     session: Annotated[AsyncSession, Depends(get_session)],
-    from_datetime: Annotated[str, Query(description="Time Start: (ISO format)")] = None,
-    to_datetime: Annotated[str, Query(description="Time End: (ISO format)")] = None,
-    page: Annotated[int, Query(ge=0)] = 0,
-    page_size: Annotated[int, Query(description="The number of record in one page", enum=[10, 50, 100])] = 10,
+    from_datetime: Annotated[
+        datetime | None, 
+        Query(description="Start time (epoch or ISO with timezone)"),
+        BeforeValidator(parse_datetime)
+    ] = None,
+    to_datetime: Annotated[
+        datetime | None, 
+        Query(description="End time (epoch or ISO with timezone)"),
+        BeforeValidator(parse_datetime)
+    ] = None,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(description="The number of record in one page", enum=[10, 20, 50, 100])] = 10,
     text_keyword: Annotated[str, Query(description="Filter messages that contain this keyword (case insensitive)")] = None
 ) -> BasePaginatedResponseFrequency:
-    
-    # --- Parse time string ---
-    from_datetime = parse_datetime(from_datetime)
-    to_datetime = parse_datetime(to_datetime)
-    
-    # --- Time validation ---
+
+    # time validation
     from_datetime, to_datetime = await validate_time_range(session, from_datetime, to_datetime)
 
-    # --- Base filters ---
+    # base filter  
     filters = [SMS_Data.ts.between(from_datetime, to_datetime)]
     if text_keyword:
         filters.append(SMS_Data.text_sms.ilike(f"%{text_keyword}%"))
 
-    # --- Aggregation query ---
-    agg_query = (
+    # cte for pre-calculate
+    cte = (
         select(
             SMS_Data.group_id,
             func.min(SMS_Data.ts).label("first_ts"),
             func.count().label("frequency"),
-            func.min_by(SMS_Data.text_sms, SMS_Data.ts).label("agg_message")
+            func.min_by(SMS_Data.text_sms, SMS_Data.ts).label("agg_message"),
+            func.sum(case((SMS_Data.predicted_label == 'spam', 1), else_=0)).label("spam_count"),
+            func.sum(case((SMS_Data.predicted_label == 'not_spam', 1), else_=0)).label("not_spam_count"),
         )
-        .where(*filters)
+        .where(and_(*filters))
         .group_by(SMS_Data.group_id)
-        .having(func.count() >= 20)
-        .subquery()
+        .cte("cte")
     )
 
-    # --- Pagination query ---
+    # spam and not_spam condition
+    spam_condition = and_(cte.c.frequency >= 20, cte.c.spam_count > cte.c.not_spam_count)
+    not_spam_condition = and_(cte.c.frequency >= 30, cte.c.spam_count <= cte.c.not_spam_count)
+
+    # main query
     main_stmt = (
         select(
-            agg_query.c.group_id,
-            agg_query.c.first_ts,
-            agg_query.c.frequency,
-            agg_query.c.agg_message,
-            func.count().over().label("total_records")
+            cte.c.group_id,
+            cte.c.first_ts,
+            cte.c.frequency,
+            cte.c.agg_message,
+            case((cte.c.spam_count >= cte.c.not_spam_count, 'spam'), else_='not_spam').label("label"),
+            func.count().over().label("total_records"),
         )
-        .order_by(agg_query.c.first_ts, agg_query.c.group_id)
-        .offset(page * page_size)
+        .where(or_(spam_condition, not_spam_condition))
+        .order_by(cte.c.first_ts, cte.c.group_id)
+        .offset((page - 1) * page_size) 
         .limit(page_size)
     )
-    result_record = await session.execute(main_stmt)
-    grouped_records = result_record.all()
+    result = await session.execute(main_stmt)
+    grouped_records = result.all()
     total_records = grouped_records[0].total_records if grouped_records else 0
 
-    # --- Second query: all messages ---
+    if total_records == 0:
+        return BasePaginatedResponseContent(
+            status_code=200,
+            message="No data found",
+            data=[],
+            error=False,
+            error_message="",
+            page=page,
+            limit=page_size,
+            total=0
+        )
+
+    # get all the message for each group
     group_ids = [r.group_id for r in grouped_records]
 
     msg_stmt = (
@@ -87,8 +111,8 @@ async def get_spam_base_on_frequency(
         )
         .group_by(SMS_Data.group_id, SMS_Data.text_sms)
     )
-    result_message = await session.execute(msg_stmt)
-    all_messages = result_message.all()
+    result = await session.execute(msg_stmt)
+    all_messages = result.all()
 
     # --- Build message dictionary ---
     messages_dict = defaultdict(list)
@@ -98,7 +122,7 @@ async def get_spam_base_on_frequency(
         )
 
     # --- Build result ---
-    start_index = page * page_size + 1
+    start_index = (page-1) * page_size + 1
     result = [
         SMSGroupedFrequency(
             stt=i,
@@ -106,6 +130,7 @@ async def get_spam_base_on_frequency(
             frequency=r.frequency,
             ts=r.first_ts,
             agg_message=r.agg_message,
+            label=r.label,
             messages=messages_dict.get(r.group_id, [])
         )
         for i, r in enumerate(grouped_records, start=start_index)
@@ -126,14 +151,20 @@ async def get_spam_base_on_frequency(
 @router.get("/export")
 async def export_frequency_data(
     session: AsyncSession = Depends(get_session),
-    from_datetime: str = Query(None, description="Time Start: (ISO format)"),
-    to_datetime: str = Query(None, description="Time End: (ISO format)"),
+    from_datetime: Annotated[
+        datetime | None, 
+        Query(description="Start time (epoch)"),
+        BeforeValidator(parse_datetime)
+    ] = None,
+    to_datetime: Annotated[
+        datetime | None, 
+        Query(description="End time (epoch)"),
+        BeforeValidator(parse_datetime)
+    ] = None,
     text_keyword: str = Query(None, description="Filter messages that contain this keyword (case insensitive)")
 ):
 
-    # --- Parse and validate datetime ---
-    from_datetime = parse_datetime(from_datetime)
-    to_datetime = parse_datetime(to_datetime)
+    # --- Time validation ---
     from_datetime, to_datetime = await validate_time_range(session, from_datetime, to_datetime)
 
     # --- Build filters ---
@@ -141,19 +172,37 @@ async def export_frequency_data(
     if text_keyword:
         filters.append(SMS_Data.text_sms.ilike(f"%{text_keyword}%"))
 
-    # --- Aggregation query ---
-    agg_query = (
+    cte = (
         select(
             SMS_Data.group_id,
-            func.count().label("frequency"),
             func.min(SMS_Data.ts).label("first_ts"),
-            func.min_by(SMS_Data.text_sms, SMS_Data.ts).label("agg_message")
+            func.count().label("frequency"),
+            func.min_by(SMS_Data.text_sms, SMS_Data.ts).label("agg_message"),
+            func.sum(case((SMS_Data.predicted_label == 'spam', 1), else_=0)).label("spam_count"),
+            func.sum(case((SMS_Data.predicted_label == 'not_spam', 1), else_=0)).label("not_spam_count"),
         )
-        .where(*filters)
+        .where(and_(*filters))
         .group_by(SMS_Data.group_id)
-        .having(func.count() >= 20)
+        .cte("cte")
+    )
+
+    # spam and not_spam condition
+    spam_condition = and_(cte.c.frequency >= 20, cte.c.spam_count > cte.c.not_spam_count)
+    not_spam_condition = and_(cte.c.frequency >= 30, cte.c.spam_count <= cte.c.not_spam_count)
+
+    # main query
+    main_stmt = (
+        select(
+            cte.c.group_id,
+            cte.c.first_ts,
+            cte.c.frequency,
+            cte.c.agg_message,
+            case((cte.c.spam_count >= cte.c.not_spam_count, 'spam'), else_='not_spam').label("label"),
+        )
+        .where(or_(spam_condition, not_spam_condition))
         .execution_options(stream_results=True)
     )
+
 
     # --- Async CSV streaming generator ---
     async def stream():
@@ -161,7 +210,7 @@ async def export_frequency_data(
         writer = csv.writer(buffer, quoting=csv.QUOTE_ALL)
 
         # Write header
-        writer.writerow(["group_id", "frequency", "first_ts", "agg_message"])
+        writer.writerow(["group_id", "frequency", "first_ts", "agg_message", "label"])
         yield buffer.getvalue()
         buffer.seek(0)
         buffer.truncate(0)
@@ -169,10 +218,10 @@ async def export_frequency_data(
         # Stream rows from DB within a transaction
         row_count = 0
         async with session.begin():  # Ensure session remains open during streaming
-            result = await session.stream(agg_query)  # Await to get AsyncResult
+            result = await session.stream(main_stmt)  # Await to get AsyncResult
             async for row in result:  # Iterate directly over AsyncResult
                 row_count += 1
-                writer.writerow([row.group_id, row.frequency, row.first_ts, row.agg_message])
+                writer.writerow([row.group_id, row.frequency, row.first_ts, row.agg_message, row.label])
                 yield buffer.getvalue()
                 buffer.seek(0)
                 buffer.truncate(0)
