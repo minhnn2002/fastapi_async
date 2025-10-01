@@ -1,6 +1,7 @@
 from pydantic import BaseModel, ConfigDict, field_validator
 from datetime import datetime, timezone, timedelta
 
+# Model for GET API
 class MessageCount(BaseModel):
     text_sms: str|None
     count: int
@@ -40,7 +41,7 @@ class BasePaginatedResponseFrequency(BaseResponse):
 
 
 
-
+# Model for Feedback
 class BaseFeedback(BaseModel):
     feedback: bool
     group_id: str
@@ -52,6 +53,23 @@ class FrequencyFeedback(BaseFeedback):
 class ContentFeedback(FrequencyFeedback):
     sdt_in: str
     
+
+# Model for export
+class SMSExportFrequency(BaseModel):
+    group_id: str
+    frequency: int
+    ts: datetime
+    agg_message: str
+    label: str
+
+class SMSExportContent(BaseModel):
+    group_id: str
+    sdt_in: str
+    frequency: int
+    ts: datetime
+    agg_message: str
+    label: str
+
 
 
 

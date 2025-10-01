@@ -22,15 +22,14 @@ router = APIRouter(
 @router.get("/")
 async def get_spam_base_on_content(
     session: Annotated[AsyncSession, Depends(get_session)],
-    from_datetime: Annotated[
-        datetime | None, 
+    from_datetime: Annotated[datetime | None, 
         Query(description="Start time (epoch)"),
-        BeforeValidator(parse_datetime)
+        # BeforeValidator(parse_datetime)
     ] = None,
     to_datetime: Annotated[
         datetime | None, 
         Query(description="End time (epoch)"),
-        BeforeValidator(parse_datetime)
+        # BeforeValidator(parse_datetime)
     ] = None,
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(description="The number of record in one page", enum=[10, 20, 50, 100])] = 10,
@@ -214,41 +213,25 @@ async def export_content_data(
             case((cte.c.spam_count >= cte.c.not_spam_count, 'spam'), else_='not_spam').label("label"),
         )
         .where(or_(spam_condition, not_spam_condition))
-        .execution_options(stream_results=True)
     )
 
+    result = await session.execute(main_stmt)
+    grouped_records = result.all()
 
-    # --- Async CSV streaming generator ---
-    async def stream():
-        buffer = io.StringIO()
-        writer = csv.writer(buffer, quoting=csv.QUOTE_ALL)
+    output = [
+        SMSExportContent(
+            group_id=r.group_id,
+            sdt_in=r.sdt_in,
+            frequency=r.frequency,
+            ts=r.first_ts,
+            agg_message=r.agg_message,
+            label=r.label
+        )
+        for r in grouped_records
+    ]
 
-        # Write header
-        writer.writerow(["group_id", "sdt_in", "frequency", "first_ts", "agg_message", "label"])
-        yield buffer.getvalue()
-        buffer.seek(0)
-        buffer.truncate(0)
+    return output
 
-        # Stream rows from DB within a transaction
-        row_count = 0
-        async with session.begin():  # Ensure session remains open during streaming
-            result = await session.stream(main_stmt)  # Await to get AsyncResult
-            async for row in result:  # Iterate directly over AsyncResult
-                row_count += 1
-                writer.writerow([row.group_id, row.sdt_in, row.frequency, row.first_ts, row.agg_message, row.label])
-                yield buffer.getvalue()
-                buffer.seek(0)
-                buffer.truncate(0)
-            if row_count == 0:
-                writer.writerow(["No data found"])
-                yield buffer.getvalue()
-
-    # --- Return StreamingResponse ---
-    return StreamingResponse(
-        stream(),
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": "attachment; filename=content_export.csv"}
-    )
 
 @router.put("/")
 async def feedback_base_on_content(
