@@ -2,16 +2,15 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, status, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, update, or_, case, text, tuple_
+from sqlalchemy import select, func, and_, update, or_, case, text, tuple_, cast, bindparam
 from app.db import get_session
 from app.models import SMS_Data
 from app.schemas import *
 from app.utils import *
 from app.config import settings
 from collections import defaultdict
-from pydantic import BeforeValidator
-import csv
-import io
+from pydantic import BeforeValidator, AfterValidator
+
 
 
 router = APIRouter(
@@ -22,23 +21,32 @@ router = APIRouter(
 @router.get("/")
 async def get_spam_base_on_content(
     session: Annotated[AsyncSession, Depends(get_session)],
-    from_datetime: Annotated[datetime | None, 
+    from_datetime: Annotated[
+        datetime|None, 
         Query(description="Start time (epoch)"),
-        # BeforeValidator(parse_datetime)
+        BeforeValidator(parse_datetime)
     ] = None,
     to_datetime: Annotated[
-        datetime | None, 
+        datetime|None, 
         Query(description="End time (epoch)"),
-        # BeforeValidator(parse_datetime)
+        BeforeValidator(parse_datetime)
     ] = None,
-    page: Annotated[int, Query(ge=1)] = 1,
-    page_size: Annotated[int, Query(description="The number of record in one page", enum=[10, 20, 50, 100])] = 10,
+    page: Annotated[
+        int, 
+        Query(ge=1, description="The page number"),
+        BeforeValidator(validate_page)
+    ] = 1,
+    page_size: Annotated[
+        int, 
+        Query(description="The number of record in one page", enum=[10, 20, 50, 100]),
+        BeforeValidator(validate_page_size)
+    ] = 10,
     text_keyword: Annotated[str, Query(description="Filter messages that contain this keyword (case insensitive)")] = None,
     phone_num: Annotated[str, Query(description="Filter phone number that contain this pattern (case insensitive)")] = None
 ) -> BasePaginatedResponseContent:
 
     # time validation
-    from_datetime, to_datetime = await validate_time_range(session, from_datetime, to_datetime)
+    from_datetime, to_datetime = validate_time_range(from_datetime, to_datetime)
 
     # base filter  
     filters = [SMS_Data.ts.between(from_datetime, to_datetime)]
@@ -54,7 +62,10 @@ async def get_spam_base_on_content(
             SMS_Data.sdt_in,
             func.min(SMS_Data.ts).label("first_ts"),
             func.count().label("frequency"),
-            func.min_by(SMS_Data.text_sms, SMS_Data.ts).label("agg_message"),
+            func.min_by(
+                SMS_Data.text_sms, 
+                func.unix_timestamp(SMS_Data.ts) * 1000000000 + func.xx_hash3_64(SMS_Data.id)
+            ).label("agg_message"),
             func.sum(case((SMS_Data.predicted_label == 'spam', 1), else_=0)).label("spam_count"),
             func.sum(case((SMS_Data.predicted_label == 'not_spam', 1), else_=0)).label("not_spam_count"),
         )
@@ -173,7 +184,7 @@ async def export_content_data(
 ):
 
     # --- Time validation ---
-    from_datetime, to_datetime = await validate_time_range(session, from_datetime, to_datetime)
+    from_datetime, to_datetime = validate_time_range(from_datetime, to_datetime)
 
     # --- Build filters ---
     filters = [SMS_Data.ts.between(from_datetime, to_datetime)]
@@ -189,7 +200,10 @@ async def export_content_data(
             SMS_Data.sdt_in,
             func.min(SMS_Data.ts).label("first_ts"),
             func.count().label("frequency"),
-            func.min_by(SMS_Data.text_sms, SMS_Data.ts).label("agg_message"),
+            func.min_by(
+                SMS_Data.text_sms, 
+                func.unix_timestamp(SMS_Data.ts) * 1000000000 + func.xx_hash3_64(SMS_Data.id)
+            ).label("agg_message"),
             func.sum(case((SMS_Data.predicted_label == 'spam', 1), else_=0)).label("spam_count"),
             func.sum(case((SMS_Data.predicted_label == 'not_spam', 1), else_=0)).label("not_spam_count"),
         )
@@ -243,38 +257,45 @@ async def feedback_base_on_content(
             status_code=400, detail="No feedback data provided"
         )
 
-    cases_group = []
-    cases_sdt = []
-    params = {}
+    # 1. Condition parameter
+    where_conditions = [] 
+    case_conditions = []
+    update_params = {}
 
     for idx, item in enumerate(user_feedback):
         gid_key = f"gid_{idx}"
         sdt_key = f"sdt_{idx}"
         fb_key = f"fb_{idx}"
+        
+        update_params[gid_key] = item.group_id
+        update_params[sdt_key] = item.sdt_in
+        update_params[fb_key] = item.feedback
 
-        cases_group.append(f"WHEN :{gid_key} AND sdt_in = :{sdt_key} THEN :{fb_key}")
-        cases_sdt.append(f"(group_id = :{gid_key} AND sdt_in = :{sdt_key})")
+        condition = (SMS_Data.group_id == bindparam(gid_key)) & (SMS_Data.sdt_in == bindparam(sdt_key))
+        where_conditions.append(condition)
+        case_conditions.append((condition, bindparam(fb_key)))
 
-        params[gid_key] = item.group_id
-        params[sdt_key] = item.sdt_in
-        params[fb_key] = item.feedback
+    # 2. update condition and query
+    combined_where = or_(*where_conditions)
+    combined_case = case(*case_conditions, else_=SMS_Data.feedback) 
+    
+    stmt_update = (
+        update(SMS_Data)
+        .where(combined_where)
+        .values(feedback=combined_case)
+    )
 
-    case_sql = " ".join(cases_group)
-    where_sql = " OR ".join(cases_sdt)
-
-    sql = text(f"""
-        UPDATE {settings.TABLE_NAME}
-        SET feedback = CASE {case_sql} END
-        WHERE {where_sql}
-    """)
-
-    result = await session.execute(sql, params)
+    result = await session.execute(stmt_update, update_params)
     await session.commit()
-
     total_updated = result.rowcount or 0
+    
+    # handle exception
     if total_updated == 0:
-        raise HTTPException(status_code=404, detail="No records matched your condition")
-
+        raise HTTPException(
+            status_code=404, 
+            detail="No records matched your condition."
+        )
+    
     return BaseResponse(
         status_code=200,
         message=f"Updated {total_updated} records",
